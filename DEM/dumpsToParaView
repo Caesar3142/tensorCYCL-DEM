@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""Convert cyclone-separator LIGGGHTS dumps for ParaView (physical time).
+
+DEM dumps use LIGGGHTS steps (50000, 55000, ...). CFD uses seconds
+(0, 0.05, ..., 1). Mapping:
+
+  t_phys = (DEM_step - step0) * dt
+
+Defaults (this case): dt=1e-6, step0=first dump step.
+
+IMPORTANT for ParaView time sync:
+  Open DEM/post/particles.pvd   <-- not the CSV files
+  CSV file series often shows frame index 0,1,2,... instead of seconds.
+
+Usage:
+  ./dumpsToParaView
+"""
+
+import argparse
+import re
+import sys
+from math import sqrt
+from pathlib import Path
+
+
+def parse_atoms_header(line):
+    if "ITEM: ATOMS" not in line:
+        raise ValueError("Not an ATOMS header: %s" % line)
+    cols = line.split("ITEM: ATOMS", 1)[1].split()
+    out = []
+    for c in cols:
+        if c.startswith("f_dragforce["):
+            idx = c[c.find("[") + 1 : c.find("]")]
+            out.append({"1": "fdx", "2": "fdy", "3": "fdz"}.get(idx, c))
+        else:
+            out.append(c)
+    return out
+
+
+def parse_atom(cols, parts):
+    if len(parts) < len(cols):
+        return None
+    try:
+        data = dict((name, parts[i]) for i, name in enumerate(cols))
+        int(data["id"])
+    except (KeyError, ValueError, IndexError):
+        return None
+    needed = ("id", "type", "x", "y", "z", "vx", "vy", "vz", "radius")
+    for k in needed:
+        if k not in data:
+            return None
+    atom = {
+        "id": int(data["id"]),
+        "type": int(data["type"]),
+        "x": float(data["x"]),
+        "y": float(data["y"]),
+        "z": float(data["z"]),
+        "vx": float(data["vx"]),
+        "vy": float(data["vy"]),
+        "vz": float(data["vz"]),
+        "radius": float(data["radius"]),
+    }
+    atom["vmag"] = sqrt(atom["vx"] ** 2 + atom["vy"] ** 2 + atom["vz"] ** 2)
+    if all(k in data for k in ("fdx", "fdy", "fdz")):
+        atom["fdx"] = float(data["fdx"])
+        atom["fdy"] = float(data["fdy"])
+        atom["fdz"] = float(data["fdz"])
+        atom["fdmag"] = sqrt(atom["fdx"] ** 2 + atom["fdy"] ** 2 + atom["fdz"] ** 2)
+    return atom
+
+
+def parse_dump_frames(text):
+    """Yield (dem_step, atoms_list)."""
+    lines = text.splitlines()
+    current_step = None
+    atoms = []
+    cols = None
+
+    def flush():
+        if current_step is None or not atoms:
+            return None
+        return (current_step, list(atoms))
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if "ITEM: TIMESTEP" in line:
+            done = flush()
+            if done is not None:
+                yield done
+            atoms = []
+            current_step = int(lines[i + 1].strip())
+            i += 2
+            continue
+        if "ITEM: ATOMS" in line:
+            cols = parse_atoms_header(line)
+            i += 1
+            continue
+        if line.startswith("ITEM:"):
+            i += 1
+            continue
+        if cols is not None:
+            atom = parse_atom(cols, line.split())
+            if atom is not None:
+                atoms.append(atom)
+        i += 1
+
+    done = flush()
+    if done is not None:
+        yield done
+
+
+def write_vtp(path, atoms):
+    """XML VTK PolyData (.vtp) — required for a working ParaView .pvd collection.
+
+    Legacy .vtk inside .pvd often loads as a dead pipeline (no eye icon, no filters).
+    """
+    n = len(atoms)
+    has_drag = bool(atoms) and "fdmag" in atoms[0]
+
+    def arr3(keys):
+        return "\n".join(
+            "%.8g %.8g %.8g" % (a[keys[0]], a[keys[1]], a[keys[2]]) for a in atoms
+        )
+
+    def arr1(key, fmt="%.8g"):
+        return "\n".join(fmt % a[key] for a in atoms)
+
+    connectivity = "\n".join(str(i) for i in range(n))
+    offsets = "\n".join(str(i + 1) for i in range(n))
+
+    point_data = [
+        '        <DataArray type="Int32" Name="id" format="ascii">',
+        arr1("id", "%d"),
+        "        </DataArray>",
+        '        <DataArray type="Int32" Name="type" format="ascii">',
+        arr1("type", "%d"),
+        "        </DataArray>",
+        '        <DataArray type="Float32" Name="radius" format="ascii">',
+        arr1("radius"),
+        "        </DataArray>",
+        '        <DataArray type="Float32" Name="vmag" format="ascii">',
+        arr1("vmag"),
+        "        </DataArray>",
+        '        <DataArray type="Float32" Name="velocity" NumberOfComponents="3" format="ascii">',
+        arr3(("vx", "vy", "vz")),
+        "        </DataArray>",
+    ]
+    if has_drag:
+        point_data.extend(
+            [
+                '        <DataArray type="Float32" Name="fdmag" format="ascii">',
+                arr1("fdmag"),
+                "        </DataArray>",
+                '        <DataArray type="Float32" Name="dragforce" NumberOfComponents="3" format="ascii">',
+                arr3(("fdx", "fdy", "fdz")),
+                "        </DataArray>",
+            ]
+        )
+
+    xml = [
+        '<?xml version="1.0"?>',
+        '<VTKFile type="PolyData" version="0.1" byte_order="LittleEndian">',
+        "  <PolyData>",
+        '    <Piece NumberOfPoints="%d" NumberOfVerts="%d">' % (n, n),
+        "      <Points>",
+        '        <DataArray type="Float32" NumberOfComponents="3" format="ascii">',
+        arr3(("x", "y", "z")),
+        "        </DataArray>",
+        "      </Points>",
+        "      <Verts>",
+        '        <DataArray type="Int32" Name="connectivity" format="ascii">',
+        connectivity,
+        "        </DataArray>",
+        '        <DataArray type="Int32" Name="offsets" format="ascii">',
+        offsets,
+        "        </DataArray>",
+        "      </Verts>",
+        '      <PointData Scalars="radius" Vectors="velocity">',
+    ]
+    xml.extend(point_data)
+    xml.extend(
+        [
+            "      </PointData>",
+            "    </Piece>",
+            "  </PolyData>",
+            "</VTKFile>",
+            "",
+        ]
+    )
+    path.write_text("\n".join(xml))
+
+
+def write_csv(path, atoms):
+    has_drag = bool(atoms) and "fdmag" in atoms[0]
+    if has_drag:
+        hdr = "id,type,x,y,z,vx,vy,vz,vmag,radius,fdx,fdy,fdz,fdmag\n"
+    else:
+        hdr = "id,type,x,y,z,vx,vy,vz,vmag,radius\n"
+    rows = []
+    for a in atoms:
+        row = [
+            str(a["id"]),
+            str(a["type"]),
+            "%.8g" % a["x"],
+            "%.8g" % a["y"],
+            "%.8g" % a["z"],
+            "%.8g" % a["vx"],
+            "%.8g" % a["vy"],
+            "%.8g" % a["vz"],
+            "%.8g" % a["vmag"],
+            "%.8g" % a["radius"],
+        ]
+        if has_drag:
+            row.extend(
+                [
+                    "%.8g" % a["fdx"],
+                    "%.8g" % a["fdy"],
+                    "%.8g" % a["fdz"],
+                    "%.8g" % a["fdmag"],
+                ]
+            )
+        rows.append(",".join(row) + "\n")
+    path.write_text(hdr + "".join(rows))
+
+
+def write_pvd(path, entries):
+    """entries: list of (time, relative_vtk_filename)"""
+    lines = [
+        '<?xml version="1.0"?>',
+        '<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">',
+        "  <Collection>",
+    ]
+    for t, fname in entries:
+        lines.append(
+            '    <DataSet timestep="%.9g" group="" part="0" file="%s"/>' % (t, fname)
+        )
+    lines.append("  </Collection>")
+    lines.append("</VTKFile>")
+    path.write_text("\n".join(lines) + "\n")
+
+
+def timestep_from_name(path):
+    m = re.search(r"dump(\d+)\.liggghts_run$", path.name)
+    return int(m.group(1)) if m else None
+
+
+def phys_time(dem_step, step0, dt):
+    return round((dem_step - step0) * dt, 9)
+
+
+def time_tag(t):
+    return "%.6f" % t
+
+
+def main():
+    ap = argparse.ArgumentParser(description="LIGGGHTS dumps -> ParaView VTK/PVD")
+    ap.add_argument("--dir", type=Path, default=None)
+    ap.add_argument("--dt", type=float, default=1.0e-6)
+    ap.add_argument("--step0", type=int, default=None)
+    ap.add_argument("--csv", action="store_true", help="Also write CSV files")
+    ap.add_argument("--keep-old", action="store_true")
+    args = ap.parse_args()
+
+    script_dir = Path(__file__).resolve().parent
+    out_dir = args.dir or (script_dir / "post")
+    if not out_dir.is_dir():
+        sys.exit("ERROR: dump directory not found: %s" % out_dir)
+
+    run_dumps = sorted(
+        out_dir.glob("dump*.liggghts_run"),
+        key=lambda p: timestep_from_name(p) or 0,
+    )
+    if not run_dumps:
+        sys.exit("ERROR: no dump*.liggghts_run in %s" % out_dir)
+
+    steps = [s for s in (timestep_from_name(p) for p in run_dumps) if s is not None]
+    step0 = args.step0 if args.step0 is not None else min(steps)
+
+    if not args.keep_old:
+        for pattern in (
+            "frame_*.csv",
+            "particles_*.csv",
+            "particles_*.vtk",
+            "particles_*.vtp",
+            "init_frame_*.csv",
+            "particles.series",
+            "particles.pvd",
+        ):
+            for old in out_dir.glob(pattern):
+                old.unlink()
+
+    pvd_entries = []
+    total = 0
+
+    print("Time mapping: t_phys = (DEM_step - %d) * %g" % (step0, args.dt))
+    print("  DEM_step  ->  t_phys [s]  ->  VTP file")
+
+    for dump in run_dumps:
+        for dem_step, atoms in parse_dump_frames(dump.read_text()):
+            t = phys_time(dem_step, step0, args.dt)
+            tag = time_tag(t)
+            vtp_name = "particles_%s.vtp" % tag
+            write_vtp(out_dir / vtp_name, atoms)
+            pvd_entries.append((t, vtp_name))
+            if args.csv:
+                write_csv(out_dir / ("particles_%s.csv" % tag), atoms)
+            total += 1
+            print("  %8d  ->  %8g  ->  %s" % (dem_step, t, vtp_name))
+
+    pvd_entries.sort(key=lambda e: e[0])
+    pvd_path = out_dir / "particles.pvd"
+    write_pvd(pvd_path, pvd_entries)
+
+    print("Wrote %s (%d times: %g .. %g s)" % (
+        pvd_path,
+        len(pvd_entries),
+        pvd_entries[0][0],
+        pvd_entries[-1][0],
+    ))
+    print("Success! %d frames." % total)
+    print("")
+    print("ParaView (times match CFD absolute time):")
+    print("  1. File -> Open -> DEM/post/particles.pvd  (XML .vtp collection)")
+    print("  2. Click Apply if needed - eye icon should appear")
+    print("  3. Representation = Point Gaussian (or Glyph -> Sphere by radius)")
+    print("  4. Reset Camera; also open CFD/cycloneSeparator.foam")
+    if pvd_entries[-1][0] + 1e-12 < max(steps) * args.dt:
+        pass
+    print("  Note: if CFD time >> DEM PVD time, CFD/DEM clocks are desynced;")
+    print("        use ./parCFDDEMcontinue.sh (updated) to resume from a synced time.")
+
+
+if __name__ == "__main__":
+    main()

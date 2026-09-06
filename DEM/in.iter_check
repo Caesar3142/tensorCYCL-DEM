@@ -1,0 +1,23 @@
+
+echo both
+log log.iter_check
+atom_style granular
+atom_modify map array
+communicate single vel yes
+boundary f f f
+newton off
+units si
+region domain block -0.18 0.18 -0.18 0.18 -0.62 0.19 units box
+create_box 1 domain
+neighbor 0.003 bin
+neigh_modify delay 0
+fix m1 all property/global youngsModulus peratomtype 5.e7
+fix m2 all property/global poissonsRatio peratomtype 0.25
+fix m3 all property/global coefficientRestitution peratomtypepair 1 0.35
+fix m4 all property/global coefficientFriction peratomtypepair 1 0.40
+pair_style gran model hertz tangential history
+pair_coeff * *
+timestep 0.000001
+fix bodyMesh all mesh/surface file body.work.stl type 1 curvature_tolerant yes
+fix walls all wall/gran model hertz tangential history mesh n_meshes 1 meshes bodyMesh
+print MESH_OK

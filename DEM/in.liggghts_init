@@ -1,0 +1,44 @@
+# Optional DEM-only geometry check for the empty cyclone.
+echo            both
+log             ../DEM/log.liggghts
+
+atom_style      granular
+atom_modify     map array
+atom_modify     sort 0 0.0
+communicate     single vel yes
+
+boundary        f f f
+newton          off
+
+units           si
+
+# Domain encloses body.stl (x/y +/-0.160, z -0.600 to 0.172 m).
+region          reg block -0.18 0.18 -0.18 0.18 -0.62 0.19 units box
+create_box      1 reg
+
+neighbor        0.0006 bin
+neigh_modify    delay 0
+
+# Effective quartz/sand contact properties. Young's modulus is softened from
+# real quartz but kept high enough to limit visible wall overlap.
+fix         m1 all property/global youngsModulus peratomtype 5.e7
+fix         m2 all property/global poissonsRatio peratomtype 0.25
+fix         m3 all property/global coefficientRestitution peratomtypepair 1 0.20
+fix         m4 all property/global coefficientFriction peratomtypepair 1 0.02
+
+pair_style  gran model hertz tangential no_history
+pair_coeff  * *
+
+timestep    0.0000005
+fix         gravi all gravity 9.81 vector 0.0 0.0 -1.0
+
+# body.stl includes the cyclone shell, inlet duct and collection bin walls.
+fix         bodyMesh all mesh/surface file body.stl type 1 curvature_tolerant yes
+fix         walls all wall/gran model hertz tangential no_history mesh n_meshes 1 meshes bodyMesh
+
+thermo_style    custom step atoms ke vol
+thermo          1
+thermo_modify   lost ignore norm no
+
+run             0
+write_restart   post/restart/liggghts.restart

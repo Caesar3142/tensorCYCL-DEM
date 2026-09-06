@@ -1,0 +1,28 @@
+# Serial-only: write DEM/body.exclude for triangles LIGGGHTS rejects
+# (hard angles, >5 neighbors, duplicates). wall/gran + run 0 is required
+# so neighbor-count failures are included (write during mesh import alone
+# only catches hard-angle / duplicate faces).
+echo            both
+log             log.write_exclude
+atom_style      granular
+atom_modify     map array
+atom_modify     sort 0 0.0
+communicate     single vel yes
+boundary        f f f
+newton          off
+units           si
+region          domain block -0.18 0.18 -0.18 0.18 -0.62 0.19 units box
+create_box      1 domain
+neighbor        0.003 bin
+neigh_modify    delay 0
+fix         m1 all property/global youngsModulus peratomtype 5.e7
+fix         m2 all property/global poissonsRatio peratomtype 0.25
+fix         m3 all property/global coefficientRestitution peratomtypepair 1 0.20
+fix         m4 all property/global coefficientFriction peratomtypepair 1 0.02
+pair_style  gran model hertz tangential history
+pair_coeff  * *
+timestep    0.0000005
+fix         bodyMesh all mesh/surface file body.stl type 1 element_exclusion_list write body.exclude curvature_tolerant yes
+fix         walls all wall/gran model hertz tangential history mesh n_meshes 1 meshes bodyMesh
+run             0
+print           "EXCLUDE_WRITE_DONE"
